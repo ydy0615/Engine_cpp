@@ -1,0 +1,26 @@
+# Build outputs
+/test
+/map_editor
+/test_build
+*.o
+*.obj
+*.out
+*.exe
+*.so
+*.a
+*.dylib
+
+# Map editor exports
+/map_export_*.json
+/map_editor_last.json
+
+# Editor and OS files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+2D_data/
+2D_pixel/
