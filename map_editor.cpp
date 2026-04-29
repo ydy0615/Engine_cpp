@@ -377,6 +377,7 @@ public:
             if (!dirty && !XPending(display)) {
                 XEvent event;
                 XNextEvent(display, &event);
+                coalesce_motion_events(event);
                 had_event = true;
                 handle_event(event);
             }
@@ -384,6 +385,7 @@ public:
             while (XPending(display)) {
                 XEvent event;
                 XNextEvent(display, &event);
+                coalesce_motion_events(event);
                 had_event = true;
                 handle_event(event);
             }
@@ -441,6 +443,11 @@ private:
     int mouse_y = 0;
     int hover_row = -1;
     int hover_col = -1;
+    int drawn_hover_sx = -1;
+    int drawn_hover_sy = -1;
+    int drawn_hover_w = 0;
+    int drawn_hover_h = 0;
+    bool hover_overlay_drawn = false;
     int active_template = 0;
     int active_frame = 0;
     int selected_item = -1;
@@ -585,6 +592,17 @@ private:
     void mark_all_dirty() {
         mark_canvas_dirty();
         mark_panel_dirty();
+    }
+
+    void coalesce_motion_events(XEvent& event) {
+        if (event.type != MotionNotify) return;
+        if (drag_mode == DragMode::Paint) return;
+        while (XPending(display)) {
+            XEvent next_event;
+            XPeekEvent(display, &next_event);
+            if (next_event.type != MotionNotify) break;
+            XNextEvent(display, &event);
+        }
     }
 
     void clamp_camera() {
@@ -1205,29 +1223,45 @@ private:
         }
     }
 
+    uint32_t rgb_pixel(const Color& color) const {
+        return static_cast<uint32_t>(pack_rgb(color));
+    }
+
+    Color rgb_from_pixel(uint32_t pixel) const {
+        return Color::rgba((pixel >> 16) & 0xFF, (pixel >> 8) & 0xFF, pixel & 0xFF, 255);
+    }
+
+    uint32_t* canvas_row_ptr(int y) {
+        return reinterpret_cast<uint32_t*>(canvas_image->data + y * canvas_image->bytes_per_line);
+    }
+
+    const uint32_t* canvas_row_ptr(int y) const {
+        return reinterpret_cast<const uint32_t*>(canvas_image->data + y * canvas_image->bytes_per_line);
+    }
+
     void canvas_put_pixel(int x, int y, unsigned long value) {
         if (!canvas_image) return;
         if (x < 0 || x >= canvas_w || y < 0 || y >= canvas_h) return;
-        auto* row = reinterpret_cast<uint32_t*>(canvas_image->data + y * canvas_image->bytes_per_line);
-        row[x] = static_cast<uint32_t>(value);
+        canvas_row_ptr(y)[x] = static_cast<uint32_t>(value);
     }
 
-    unsigned long canvas_get_pixel(int x, int y) const {
+    uint32_t canvas_get_pixel(int x, int y) const {
         if (!canvas_image) return 0;
         if (x < 0 || x >= canvas_w || y < 0 || y >= canvas_h) return 0;
-        auto* row = reinterpret_cast<uint32_t*>(canvas_image->data + y * canvas_image->bytes_per_line);
-        return row[x];
+        return canvas_row_ptr(y)[x];
     }
 
     void canvas_fill_rect(int x, int y, int w, int h, unsigned long value) {
+        if (!canvas_image || w <= 0 || h <= 0) return;
         int x0 = max(0, x);
         int y0 = max(0, y);
         int x1 = min(canvas_w, x + w);
         int y1 = min(canvas_h, y + h);
+        if (x0 >= x1 || y0 >= y1) return;
         uint32_t packed = static_cast<uint32_t>(value);
         for (int py = y0; py < y1; ++py) {
-            auto* row = reinterpret_cast<uint32_t*>(canvas_image->data + py * canvas_image->bytes_per_line);
-            for (int px = x0; px < x1; ++px) row[px] = packed;
+            uint32_t* row = canvas_row_ptr(py);
+            fill(row + x0, row + x1, packed);
         }
     }
 
@@ -1244,16 +1278,55 @@ private:
         return even ? Color::rgba(52, 61, 72) : Color::rgba(38, 46, 56);
     }
 
-    void draw_scaled_pixel(int screen_x, int screen_y, const Color& color, int row, int col) {
-        Color base = color.a == 0 ? checker_color(row, col) : color;
-        canvas_fill_rect(screen_x, screen_y, zoom, zoom, pack_rgb(base));
+    uint32_t checker_pixel(int row, int col) const {
+        return rgb_pixel(checker_color(row, col));
+    }
+
+    void render_background_gradient() {
+        if (!canvas_image) return;
+        for (int y = 0; y < canvas_h; ++y) {
+            Color line = Color::rgba(18 + y * 8 / max(1, canvas_h), 24 + y * 12 / max(1, canvas_h), 32 + y * 16 / max(1, canvas_h));
+            uint32_t* row = canvas_row_ptr(y);
+            fill(row, row + canvas_w, rgb_pixel(line));
+        }
+    }
+
+    void render_terrain_layer(int row_start, int row_end, int col_start, int col_end) {
+        if (!canvas_image) return;
+        int cell = max(1, zoom);
+        for (int row = row_start; row < row_end; ++row) {
+            int sy = (row - camera_row) * cell;
+            int y0 = max(0, sy);
+            int y1 = min(canvas_h, sy + cell);
+            if (y0 >= y1) continue;
+
+            uint32_t* first_screen_row = canvas_row_ptr(y0);
+            const Color* terrain_row = terrain.pixels.data() + row * terrain.w;
+            int copy_x0 = canvas_w;
+            int copy_x1 = 0;
+
+            for (int col = col_start; col < col_end; ++col) {
+                int sx = (col - camera_col) * cell;
+                int x0 = max(0, sx);
+                int x1 = min(canvas_w, sx + cell);
+                if (x0 >= x1) continue;
+                const Color& color = terrain_row[col];
+                uint32_t pixel = color.a == 0 ? checker_pixel(row, col) : rgb_pixel(color);
+                fill(first_screen_row + x0, first_screen_row + x1, pixel);
+                copy_x0 = min(copy_x0, x0);
+                copy_x1 = max(copy_x1, x1);
+            }
+
+            if (copy_x0 >= copy_x1) continue;
+            size_t copy_bytes = static_cast<size_t>(copy_x1 - copy_x0) * sizeof(uint32_t);
+            for (int y = y0 + 1; y < y1; ++y) {
+                memcpy(canvas_row_ptr(y) + copy_x0, first_screen_row + copy_x0, copy_bytes);
+            }
+        }
     }
 
     void render_canvas() {
-        for (int y = 0; y < canvas_h; ++y) {
-            Color line = Color::rgba(18 + y * 8 / max(1, canvas_h), 24 + y * 12 / max(1, canvas_h), 32 + y * 16 / max(1, canvas_h));
-            canvas_fill_rect(0, y, canvas_w, 1, pack_rgb(line));
-        }
+        render_background_gradient();
 
         int visible_rows = canvas_h / max(1, zoom) + 2;
         int visible_cols = canvas_w / max(1, zoom) + 2;
@@ -1262,13 +1335,7 @@ private:
         int col_start = camera_col;
         int col_end = min(terrain.w, camera_col + visible_cols);
 
-        for (int row = row_start; row < row_end; ++row) {
-            for (int col = col_start; col < col_end; ++col) {
-                int sx = (col - camera_col) * zoom;
-                int sy = (row - camera_row) * zoom;
-                draw_scaled_pixel(sx, sy, terrain.get(row, col), row, col);
-            }
-        }
+        render_terrain_layer(row_start, row_end, col_start, col_end);
 
         for (int item_index = 0; item_index < static_cast<int>(items.size()); ++item_index) {
             const ItemInstance& item = items[item_index];
@@ -1284,17 +1351,18 @@ private:
             int src_col_end = min(frame.w, camera_col + visible_cols - item.col);
 
             for (int src_row = src_row_begin; src_row < src_row_end; ++src_row) {
+                const Color* frame_row = frame.pixels.data() + src_row * frame.w;
                 for (int src_col = src_col_begin; src_col < src_col_end; ++src_col) {
-                    Color sprite = frame.get(src_row, src_col);
+                    const Color& sprite = frame_row[src_col];
                     if (sprite.a == 0) continue;
                     int map_row = item.row + src_row;
                     int map_col = item.col + src_col;
                     int sx = (map_col - camera_col) * zoom;
                     int sy = (map_row - camera_row) * zoom;
-                    unsigned long under = canvas_get_pixel(sx, sy);
-                    Color base = Color::rgba((under >> 16) & 0xFF, (under >> 8) & 0xFF, under & 0xFF, 255);
-                    Color blended = blend_over(base, sprite);
-                    canvas_fill_rect(sx, sy, zoom, zoom, pack_rgb(blended));
+                    uint32_t pixel = sprite.a == 255
+                                         ? rgb_pixel(sprite)
+                                         : rgb_pixel(blend_over(rgb_from_pixel(canvas_get_pixel(sx, sy)), sprite));
+                    canvas_fill_rect(sx, sy, zoom, zoom, pixel);
                 }
             }
 
@@ -1342,9 +1410,19 @@ private:
 
     string ellipsize(const string& text, int max_width) const {
         if (text_width(text) <= max_width) return text;
-        string output = text;
-        while (!output.empty() && text_width(output + "...") > max_width) output.pop_back();
-        return output + "...";
+        const string suffix = "...";
+        if (text_width(suffix) > max_width) return suffix;
+        int low = 0;
+        int high = static_cast<int>(text.size());
+        while (low < high) {
+            int mid = (low + high + 1) / 2;
+            if (text_width(text.substr(0, mid) + suffix) <= max_width) {
+                low = mid;
+            } else {
+                high = mid - 1;
+            }
+        }
+        return text.substr(0, low) + suffix;
     }
 
     void add_hit(int x, int y, int w, int h, const string& id, int value = 0) {
@@ -1400,16 +1478,37 @@ private:
         XDrawRectangle(display, window, gc, x, y, w, h);
         if (!image || image->w <= 0 || image->h <= 0) return;
 
+        char* data = static_cast<char*>(malloc(static_cast<size_t>(w) * static_cast<size_t>(h) * 4));
+        if (!data) return;
+        XImage* preview = XCreateImage(
+            display,
+            DefaultVisual(display, screen),
+            DefaultDepth(display, screen),
+            ZPixmap,
+            0,
+            data,
+            w,
+            h,
+            32,
+            0
+        );
+        if (!preview) {
+            free(data);
+            return;
+        }
+
         for (int py = 0; py < h; ++py) {
             int src_row = py * image->h / max(1, h);
+            auto* out = reinterpret_cast<uint32_t*>(preview->data + py * preview->bytes_per_line);
+            const Color* image_row = image->pixels.data() + src_row * image->w;
             for (int px = 0; px < w; ++px) {
                 int src_col = px * image->w / max(1, w);
-                Color color = image->get(src_row, src_col);
-                Color shown = color.a == 0 ? checker_color(src_row, src_col) : color;
-                XSetForeground(display, gc, pack_rgb(shown));
-                XDrawPoint(display, window, gc, x + px, y + py);
+                const Color& color = image_row[src_col];
+                out[px] = color.a == 0 ? checker_pixel(src_row, src_col) : rgb_pixel(color);
             }
         }
+        XPutImage(display, window, gc, preview, 0, 0, x, y, w, h);
+        XDestroyImage(preview);
         XSetForeground(display, gc, 0x6EA8FF);
         XDrawRectangle(display, window, gc, x, y, w, h);
     }
@@ -1763,6 +1862,8 @@ private:
     }
 
     void update_hover() {
+        int previous_row = hover_row;
+        int previous_col = hover_col;
         int row = -1;
         int col = -1;
         if (screen_to_pixel(mouse_x, mouse_y, row, col)) {
@@ -1772,7 +1873,9 @@ private:
             hover_row = -1;
             hover_col = -1;
         }
-        mark_panel_dirty();
+        if (hover_row != previous_row || hover_col != previous_col) {
+            mark_panel_dirty();
+        }
     }
 
     void handle_key_press(XKeyEvent* event) {
@@ -1976,24 +2079,45 @@ private:
         }
     }
 
+    void restore_hover_overlay() {
+        if (!hover_overlay_drawn || !canvas_image) return;
+        int x0 = max(0, drawn_hover_sx);
+        int y0 = max(0, drawn_hover_sy);
+        int x1 = min(canvas_w, drawn_hover_sx + drawn_hover_w);
+        int y1 = min(canvas_h, drawn_hover_sy + drawn_hover_h);
+        hover_overlay_drawn = false;
+        if (x0 >= x1 || y0 >= y1) return;
+        XPutImage(display, window, gc, canvas_image, x0, y0, x0, y0, x1 - x0, y1 - y0);
+    }
+
+    void draw_hover_overlay() {
+        if (hover_row < 0 || hover_col < 0) return;
+        int sx = (hover_col - camera_col) * zoom;
+        int sy = (hover_row - camera_row) * zoom;
+        if (sx + zoom <= 0 || sy + zoom <= 0 || sx >= canvas_w || sy >= canvas_h) return;
+        XSetForeground(display, gc, 0xFFFFFF);
+        XDrawRectangle(display, window, gc, sx, sy, max(1, zoom - 1), max(1, zoom - 1));
+        drawn_hover_sx = sx;
+        drawn_hover_sy = sy;
+        drawn_hover_w = max(1, zoom + 1);
+        drawn_hover_h = max(1, zoom + 1);
+        hover_overlay_drawn = true;
+    }
+
     void render() {
         if (canvas_dirty) {
             render_canvas();
             XPutImage(display, window, gc, canvas_image, 0, 0, 0, 0, canvas_w, canvas_h);
             canvas_dirty = false;
+            hover_overlay_drawn = false;
+        } else {
+            restore_hover_overlay();
         }
         if (panel_dirty) {
             draw_panel();
             panel_dirty = false;
         }
-        if (hover_row >= 0 && hover_col >= 0) {
-            int sx = (hover_col - camera_col) * zoom;
-            int sy = (hover_row - camera_row) * zoom;
-            if (sx + zoom > 0 && sy + zoom > 0 && sx < canvas_w && sy < canvas_h) {
-                XSetForeground(display, gc, 0xFFFFFF);
-                XDrawRectangle(display, window, gc, sx, sy, max(1, zoom - 1), max(1, zoom - 1));
-            }
-        }
+        draw_hover_overlay();
         XFlush(display);
         dirty = false;
     }
